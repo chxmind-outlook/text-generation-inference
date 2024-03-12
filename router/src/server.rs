@@ -30,6 +30,11 @@ use tracing::{info_span, instrument, Instrument};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
+struct InferErrorWarper {
+    err: InferError,
+    model_version: String,
+}
+
 /// Generate tokens if `stream == false` or a stream of token if `stream == true`
 #[utoipa::path(
 post,
@@ -56,6 +61,7 @@ example = json ! ({"error": "Incomplete generation"})),
 async fn compat_generate(
     Extension(default_return_full_text): Extension<bool>,
     infer: Extension<Infer>,
+    model_info: Extension<Info>,
     Json(mut req): Json<CompatGenerateRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     // default return_full_text given the pipeline_tag
@@ -65,11 +71,11 @@ async fn compat_generate(
 
     // switch on stream
     if req.stream {
-        Ok(generate_stream(infer, Json(req.into()))
+        Ok(generate_stream(infer, model_info, Json(req.into()))
             .await
             .into_response())
     } else {
-        let (headers, Json(generation)) = generate(infer, Json(req.into())).await?;
+        let (headers, Json(generation)) = generate(infer, model_info, Json(req.into())).await?;
         // wrap generation inside a Vec to match api-inference
         Ok((headers, Json(vec![generation])).into_response())
     }
@@ -99,7 +105,7 @@ example = json ! ({"error": "unhealthy", "error_type": "healthcheck"})),
 )]
 #[instrument(skip(health))]
 /// Health check method
-async fn health(mut health: Extension<Health>) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+async fn health(model_info: Extension<Info>, mut health: Extension<Health>) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     match health.check().await {
         true => Ok(()),
         false => Err((
@@ -107,6 +113,7 @@ async fn health(mut health: Extension<Health>) -> Result<(), (StatusCode, Json<E
             Json(ErrorResponse {
                 error: "unhealthy".to_string(),
                 error_type: "healthcheck".to_string(),
+                version: model_info.version.to_string(),
             }),
         )),
     }
@@ -144,6 +151,7 @@ seed,
 )]
 async fn generate(
     infer: Extension<Infer>,
+    model_info: Extension<Info>,
     Json(req): Json<GenerateRequest>,
 ) -> Result<(HeaderMap, Json<GenerateResponse>), (StatusCode, Json<ErrorResponse>)> {
     let span = tracing::Span::current();
@@ -290,6 +298,7 @@ async fn generate(
 
     let response = GenerateResponse {
         generated_text: output_text,
+        version: model_info.model_version.clone(),
         details,
     };
     Ok((headers, Json(response)))
@@ -332,6 +341,7 @@ seed,
 )]
 async fn generate_stream(
     Extension(infer): Extension<Infer>,
+    Extension(model_info): Extension<Info>,
     Json(req): Json<GenerateRequest>,
 ) -> (
     HeaderMap,
@@ -339,6 +349,7 @@ async fn generate_stream(
 ) {
     let span = tracing::Span::current();
     let start_time = Instant::now();
+    let model_version = model_info.model_version.clone();
     metrics::increment_counter!("tgi_request_count");
 
     tracing::debug!("Input: {}", req.inputs);
@@ -369,12 +380,12 @@ async fn generate_stream(
             let err = InferError::from(ValidationError::BestOfStream);
             metrics::increment_counter!("tgi_request_failure", "err" => "validation");
             tracing::error!("{err}");
-            yield Ok(Event::from(err));
+            yield Ok(Event::from(InferErrorWarper{err, model_version}));
         } else if req.parameters.decoder_input_details {
             let err = InferError::from(ValidationError::PrefillDetailsStream);
             metrics::increment_counter!("tgi_request_failure", "err" => "validation");
             tracing::error!("{err}");
-            yield Ok(Event::from(err));
+            yield Ok(Event::from(InferErrorWarper{err, model_version}));
         } else {
             match infer.generate_stream(req).instrument(info_span!(parent: &span, "async_stream")).await {
                 // Keep permit as long as generate_stream lives
@@ -393,9 +404,11 @@ async fn generate_stream(
                                     } => {
                                         tracing::debug!(parent: &span, "Token: {:?}", token);
 
+                                        let version = model_info.model_version.clone();
                                         // StreamResponse
                                         let stream_token = StreamResponse {
                                             token,
+                                            version,
                                             top_tokens,
                                             generated_text: None,
                                             details: None,
@@ -456,8 +469,10 @@ async fn generate_stream(
                                         tracing::debug!(parent: &span, "Output: {}", output_text);
                                         tracing::info!(parent: &span, "Success");
 
+                                        let version = model_info.model_version.clone();
                                         let stream_token = StreamResponse {
                                             token,
+                                            version,
                                             top_tokens,
                                             generated_text: Some(output_text),
                                             details
@@ -471,7 +486,8 @@ async fn generate_stream(
                             // yield error
                             Err(err) => {
                                 error = true;
-                                yield Ok(Event::from(err));
+                                let model_version = model_info.model_version.clone();
+                                yield Ok(Event::from(InferErrorWarper{err, model_version}));
                                 break;
                             }
                         }
@@ -480,7 +496,7 @@ async fn generate_stream(
                 // yield error
                 Err(err) => {
                     error = true;
-                    yield Ok(Event::from(err));
+                    yield Ok(Event::from(InferErrorWarper{err, model_version}));
                 }
             }
             // Check if generation reached the end
@@ -489,7 +505,8 @@ async fn generate_stream(
                 let err = InferError::IncompleteGeneration;
                 metrics::increment_counter!("tgi_request_failure", "err" => "incomplete");
                 tracing::error!("{err}");
-                yield Ok(Event::from(err));
+                let model_version = model_info.model_version.clone();
+                yield Ok(Event::from(InferErrorWarper{err, model_version}));
             }
         }
     };
@@ -661,6 +678,7 @@ pub async fn run(
     // Endpoint info
     let info = Info {
         model_id: model_info.model_id,
+        model_version: model_info.model_version,
         model_sha: model_info.sha,
         model_dtype: shard_info.dtype,
         model_device_type: shard_info.device_type,
@@ -823,17 +841,39 @@ impl From<InferError> for (StatusCode, Json<ErrorResponse>) {
             Json(ErrorResponse {
                 error: err.to_string(),
                 error_type: err.error_type().to_string(),
+                version: "N/A".to_string(), //TODO
             }),
         )
     }
 }
 
-impl From<InferError> for Event {
-    fn from(err: InferError) -> Self {
+impl From<InferErrorWarper> for (StatusCode, Json<ErrorResponse>) {
+    fn from(warper: InferErrorWarper) -> Self {
+        let status_code = match warper.err {
+            InferError::GenerationError(_) => StatusCode::FAILED_DEPENDENCY,
+            InferError::Overloaded(_) => StatusCode::TOO_MANY_REQUESTS,
+            InferError::ValidationError(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            InferError::IncompleteGeneration => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+
+        (
+            status_code,
+            Json(ErrorResponse {
+                error: warper.err.to_string(),
+                error_type: warper.err.error_type().to_string(),
+                version: warper.model_version.to_string(),
+            }),
+        )
+    }
+}
+
+impl From<InferErrorWarper> for Event {
+    fn from(warper: InferErrorWarper) -> Self {
         Event::default()
             .json_data(ErrorResponse {
-                error: err.to_string(),
-                error_type: err.error_type().to_string(),
+                error: warper.err.to_string(),
+                error_type: warper.err.error_type().to_string(),
+                version: warper.model_version.to_string(),
             })
             .unwrap()
     }

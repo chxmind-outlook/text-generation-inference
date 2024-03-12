@@ -23,6 +23,8 @@ use tracing_subscriber::{EnvFilter, Layer};
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
+    #[clap(long, env)]
+    model_version: String,    
     #[clap(default_value = "128", long, env)]
     max_concurrent_requests: usize,
     #[clap(default_value = "2", long, env)]
@@ -74,6 +76,7 @@ fn main() -> Result<(), RouterError> {
     let args = Args::parse();
     // Pattern match configuration
     let Args {
+        model_version,
         max_concurrent_requests,
         max_best_of,
         max_stop_sequences,
@@ -173,6 +176,7 @@ fn main() -> Result<(), RouterError> {
             let model_info = match local_model {
                 true => HubModelInfo {
                     model_id: tokenizer_name.clone(),
+                    model_version: model_version.clone(),
                     sha: None,
                     pipeline_tag: None,
                 },
@@ -182,6 +186,7 @@ fn main() -> Result<(), RouterError> {
                         tracing::warn!("Could not retrieve model info from the Hugging Face hub.");
                         HubModelInfo {
                             model_id: tokenizer_name.to_string(),
+                            model_version: model_version.clone(),
                             sha: None,
                             pipeline_tag: None,
                         }

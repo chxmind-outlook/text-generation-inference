@@ -128,6 +128,10 @@ struct Args {
     #[clap(default_value = "bigscience/bloom-560m", long, env)]
     model_id: String,
 
+    /// The version of the model.
+    #[clap(long, env)]
+    model_version: String,
+
     /// The actual revision of the model if you're referring to a model
     /// on the hub. You can use a specific commit id or a branch like `refs/pr/2`.
     #[clap(long, env)]
@@ -1000,6 +1004,8 @@ fn spawn_webserver(
         format!("{}-0", args.shard_uds_path),
         "--tokenizer-name".to_string(),
         args.model_id,
+        "--model-version".to_string(),
+        args.model_version,
     ];
 
     // Model optional max batch total tokens

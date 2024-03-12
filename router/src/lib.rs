@@ -16,6 +16,7 @@ use validation::Validation;
 pub struct HubModelInfo {
     #[serde(rename(deserialize = "id"))]
     pub model_id: String,
+    pub model_version: String,
     pub sha: Option<String>,
     pub pipeline_tag: Option<String>,
 }
@@ -25,6 +26,8 @@ pub struct Info {
     /// Model info
     #[schema(example = "bigscience/blomm-560m")]
     pub model_id: String,
+    #[schema(example = "tianshu")]
+    pub model_version: String,
     #[schema(nullable = true, example = "e985a63cdc139290c5f700ff1929f0b5942cced2")]
     pub model_sha: Option<String>,
     #[schema(example = "torch.float16")]
@@ -263,6 +266,8 @@ pub(crate) struct Details {
 pub(crate) struct GenerateResponse {
     #[schema(example = "test")]
     pub generated_text: String,
+    #[schema(example = "llama 2")]
+    pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Details>,
 }
@@ -280,6 +285,8 @@ pub(crate) struct StreamDetails {
 #[derive(Serialize, ToSchema)]
 pub(crate) struct StreamResponse {
     pub token: Token,
+    #[schema(example = "llama 2")]
+    pub version: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub top_tokens: Vec<Token>,
     #[schema(nullable = true, default = "null", example = "test")]
@@ -292,6 +299,7 @@ pub(crate) struct StreamResponse {
 pub(crate) struct ErrorResponse {
     pub error: String,
     pub error_type: String,
+    pub version: String,
 }
 
 #[cfg(test)]
