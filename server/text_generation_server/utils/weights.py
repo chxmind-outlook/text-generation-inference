@@ -6,7 +6,6 @@ import torch
 from loguru import logger
 from huggingface_hub import hf_hub_download
 import json
-from text_generation_server.utils.log import log_once
 
 
 class Weights:
@@ -16,8 +15,8 @@ class Weights:
         device,
         dtype,
         process_group,
+        tp_group = None,
         aliases: Optional[Dict[str, List[str]]] = None,
-        prefix: Optional[str] = None,
     ):
         routing = {}
         for filename in filenames:
@@ -35,7 +34,7 @@ class Weights:
         self.device = device
         self.dtype = dtype
         self.process_group = process_group
-        self.prefix = prefix
+        self.tp_group = tp_group if tp_group is not None else self.process_group
         self._handles = {}
 
     def _get_handle(self, filename):
@@ -46,22 +45,15 @@ class Weights:
         return self._handles[filename]
 
     def get_filename(self, tensor_name: str) -> (str, str):
-
-        names = [tensor_name]
-        if self.prefix is not None:
-            prefixed = f"{self.prefix}.{tensor_name}"
-            names.append(prefixed)
-        for name in names:
-            filename = self.routing.get(name, None)
-            if filename is not None:
-                return str(filename), name
-
-            aliases = self.aliases.get(name, [])
+        filename = self.routing.get(tensor_name, None)
+        if filename is None:
+            aliases = self.aliases.get(tensor_name, [])
             for alias in aliases:
                 filename = self.routing.get(alias, None)
                 if filename is not None:
                     return str(filename), alias
-        raise RuntimeError(f"weight {tensor_name} does not exist")
+            raise RuntimeError(f"weight {tensor_name} does not exist")
+        return str(filename), tensor_name
 
     def _get_slice(self, tensor_name: str):
         filename, tensor_name = self.get_filename(tensor_name)
@@ -72,7 +64,7 @@ class Weights:
     def get_shape(self, tensor_name: str):
         return self._get_slice(tensor_name).get_shape()
 
-    def get_tensor(self, tensor_name: str, to_device=True):
+    def get_tensor(self, tensor_name: str, to_device = True):
         filename, tensor_name = self.get_filename(tensor_name)
         f = self._get_handle(filename)
         tensor = f.get_tensor(tensor_name)
@@ -88,13 +80,14 @@ class Weights:
         filename, tensor_name = self.get_filename(tensor_name)
         f = self._get_handle(filename)
         slice_ = f.get_slice(tensor_name)
-        world_size = self.process_group.size()
+        tp_world_size = self.tp_group.size()
         rank = self.process_group.rank()
+        tp_rank = rank % tp_world_size
 
         size = slice_.get_shape()[dim]
-        block_size = size // world_size
-        start = rank * block_size
-        stop = (rank + 1) * block_size
+        block_size = size // tp_world_size
+        start = tp_rank * block_size
+        stop = (tp_rank + 1) * block_size
 
         if dim == 0:
             tensor = slice_[start:stop]
@@ -114,11 +107,13 @@ class Weights:
         f = self._get_handle(filename)
         slice_ = f.get_slice(tensor_name)
         world_size = self.process_group.size()
+        tp_world_size = self.tp_group.size()
         size = slice_.get_shape()[dim]
         assert (
-            size % world_size == 0
-        ), f"The choosen size {size} is not compatible with sharding on {world_size} shards"
+            size % tp_world_size == 0
+        ), f"The choosen size {size} is not compatible with sharding on {tp_world_size} shards while WORLD_SIZE={world_size}, TP_WORLD_SIZE={tp_world_size}"
         return self.get_partial_sharded(tensor_name, dim)
+
 
     def _get_qweight(self, name: str):
         slice_ = self._get_slice(name)
@@ -126,18 +121,18 @@ class Weights:
         assert total_size % 3 == 0, "Prepacked quantized qkv is not divisible by 3"
         single_size = total_size // 3
         world_size = self.process_group.size()
+        tp_world_size = self.tp_group.size()
         rank = self.process_group.rank()
+        tp_rank = rank % tp_world_size
 
-        assert (
-            single_size % world_size == 0
-        ), f"Prepacked quantized qkv cannot be sharded across {world_size} shards"
-        block_size = single_size // world_size
-        start = rank * block_size
-        stop = (rank + 1) * block_size
+        assert single_size % tp_world_size == 0, f"Prepacked quantized qkv cannot be sharded across {tp_world_size} shards while WORLD_SIZE={world_size}, TP_WORLD_SIZE={tp_world_size}"
+        block_size = single_size // tp_world_size
+        start = tp_rank * block_size
+        stop = (tp_rank + 1) * block_size
         q = slice_[:, start:stop]
-        k = slice_[:, start + single_size : stop + single_size]
-        v = slice_[:, start + 2 * single_size : stop + 2 * single_size]
-        weight = torch.cat([q, k, v], dim=1)
+        k = slice_[:, start+single_size:stop+single_size]
+        v = slice_[:, start+2*single_size:stop+2*single_size]
+        weight = torch.cat([q,k,v], dim=1)
         weight = weight.to(device=self.device)
         return weight
 
@@ -146,55 +141,88 @@ class Weights:
         Highly specific when the underlying tensor is a simple cat of Q,K,V instead of being
         already alternating Q,K,V within the main tensor
         """
-        if quantize in ["gptq", "awq"]:
+        if quantize == "gptq":
             try:
-                qweight = self._get_qweight(f"{prefix}.qweight")
+                qweight = self._get_qweight(f"{prefix}.qweight") 
             except RuntimeError:
                 raise RuntimeError(
-                    f"Cannot load `{quantize}` weight, make sure the model is already quantized."
+                    "Cannot load `gptq` weight, make sure the model is already quantized, or quantize it with `text-generation-server quantize ORIGINAL_MODEL_ID NEW_MODEL_ID`"
                 )
 
-            qzeros = self._get_qweight(f"{prefix}.qzeros")
-            scales = self._get_qweight(f"{prefix}.scales")
+            qzeros = self._get_qweight(f"{prefix}.qzeros") 
+            scales = self._get_qweight(f"{prefix}.scales") 
             scales = scales.to(dtype=self.dtype)
-            if quantize == "gptq":
-                g_idx = self.get_tensor(f"{prefix}.g_idx")
-            else:
-                g_idx = None
+            g_idx = self.get_tensor(f"{prefix}.g_idx")
 
-            bits, groupsize, _ = self._get_gptq_params()
+            bits, groupsize = self._get_gptq_params()
             weight = (qweight, qzeros, scales, g_idx, bits, groupsize, False)
+        if quantize == "awq":
+            try:
+                qweight = self._get_qweight(f"{prefix}.qweight") 
+            except RuntimeError:
+                raise RuntimeError(
+                    "Cannot load `awq` weight, make sure the model is already quantized"
+                )
+            qzeros = self._get_qweight(f"{prefix}.qzeros") 
+            scales = self._get_qweight(f"{prefix}.scales") 
+            scales = scales.to(dtype=self.dtype)
+
+            bits, groupsize = self._get_awq_params()
+            weight = (qweight, qzeros, scales, bits, groupsize)
         else:
-            slice_ = self._get_slice(f"{prefix}.weight")
+            slice_ = self._get_slice(f"{prefix}.weight") 
             total_size = slice_.get_shape()[0]
             assert total_size % 3 == 0, "Prepacked qkv is not divisible by 3"
             single_size = total_size // 3
             world_size = self.process_group.size()
+            tp_world_size = self.tp_group.size()
             rank = self.process_group.rank()
+            tp_rank = rank % tp_world_size
 
-            assert (
-                single_size % world_size == 0
-            ), f"Prepacked qkv cannot be sharded across {world_size} shards"
-            block_size = single_size // world_size
-            start = rank * block_size
-            stop = (rank + 1) * block_size
+            assert single_size % tp_world_size == 0, f"Prepacked qkv cannot be sharded across {world_size} shards, while WORLD_SIZE={world_size}, TP_WORLD_SIZE={tp_world_size}"
+            block_size = single_size // tp_world_size
+            start = tp_rank * block_size
+            stop = (tp_rank + 1) * block_size
             q = slice_[start:stop]
-            k = slice_[start + single_size : stop + single_size]
-            v = slice_[start + 2 * single_size : stop + 2 * single_size]
-            weight = torch.cat([q, k, v], dim=0)
+            k = slice_[start+single_size:stop+single_size]
+            v = slice_[start+2*single_size:stop+2*single_size]
+            weight = torch.cat([q,k,v], dim=0)
             weight = weight.to(device=self.device)
             weight = weight.to(dtype=self.dtype)
         return weight
 
     def get_multi_weights_col(self, prefixes: List[str], quantize: str, dim: int):
-        if quantize in ["gptq", "awq"]:
+        if quantize == "gptq":
             try:
                 qweight = torch.cat(
                     [self.get_sharded(f"{p}.qweight", dim=1) for p in prefixes], dim=1
                 )
             except RuntimeError:
                 raise RuntimeError(
-                    f"Cannot load `{quantize}` weight, make sure the model is already quantized"
+                    "Cannot load `gptq` weight, make sure the model is already quantized, or quantize it with `text-generation-server quantize ORIGINAL_MODEL_ID NEW_MODEL_ID`"
+                )
+
+            qzeros = torch.cat(
+                [self.get_sharded(f"{p}.qzeros", dim=1) for p in prefixes], dim=1
+            )
+            scales = torch.cat(
+                [self.get_sharded(f"{p}.scales", dim=1) for p in prefixes], dim=1
+            )
+            w = [self.get_tensor(f"{p}.g_idx") for p in prefixes]
+            for w2 in w[1:]:
+                torch.testing.assert_close(w2, w[0])
+            g_idx = w[0]
+
+            bits, groupsize = self._get_gptq_params()
+            weight = (qweight, qzeros, scales, g_idx, bits, groupsize, False)
+        elif quantize == "awq":
+            try:
+                qweight = torch.cat(
+                    [self.get_sharded(f"{p}.qweight", dim=1) for p in prefixes], dim=1
+                )
+            except RuntimeError:
+                raise RuntimeError(
+                    "Cannot load `awq` weight, make sure the model is already quantized"
                 )
 
             qzeros = torch.cat(
@@ -204,32 +232,21 @@ class Weights:
                 [self.get_sharded(f"{p}.scales", dim=1) for p in prefixes], dim=1
             )
 
-            if quantize == "gptq":
-                w = [self.get_tensor(f"{p}.g_idx") for p in prefixes]
-                for w2 in w[1:]:
-                    torch.testing.assert_close(w2, w[0])
-                g_idx = w[0]
-            else:
-                g_idx = None
-
-            bits, groupsize, desc_act = self._get_gptq_params()
-            from text_generation_server.utils.layers import HAS_EXLLAMA
-
-            use_exllama = (
-                bits == 4 and HAS_EXLLAMA and quantize == "gptq" and not desc_act
-            )
-            weight = (qweight, qzeros, scales, g_idx, bits, groupsize, use_exllama)
+            bits, groupsize = self._get_awq_params()
+            weight = (qweight, qzeros, scales, bits, groupsize)
         else:
             w = [self.get_sharded(f"{p}.weight", dim=0) for p in prefixes]
             weight = torch.cat(w, dim=dim)
         return weight
-
+    
     def get_tensor_shard(self, var, dim):
         world_size = self.process_group.size()
+        tp_world_size = self.tp_group.size()
         rank = self.process_group.rank()
-        block_size = var.size()[dim] // world_size
-        start = rank * block_size
-        stop = (rank + 1) * block_size
+        tp_rank = rank % tp_world_size
+        block_size = var.size()[dim] // tp_world_size
+        start = tp_rank * block_size
+        stop = (tp_rank + 1) * block_size
         if dim == 0:
             tensor = var[start:stop]
         elif dim == 1:
@@ -238,18 +255,14 @@ class Weights:
             raise NotImplementedError("Let's make that generic when needed")
         tensor = tensor.to(dtype=self.dtype)
         tensor = tensor.to(device=self.device)
-        return tensor
+        return tensor 
 
     def get_multi_weights_row(self, prefix: str, quantize: str):
         if quantize == "gptq":
             use_exllama = True
-            bits, groupsize, desc_act = self._get_gptq_params()
+            bits, groupsize = self._get_gptq_params()
 
             if bits != 4:
-                use_exllama = False
-
-            if desc_act:
-                log_once(logger.warning, "Disabling exllama because desc_act=True")
                 use_exllama = False
 
             if self.process_group.size() > 1:
@@ -281,29 +294,38 @@ class Weights:
             if use_exllama:
                 if not HAS_EXLLAMA:
                     if CAN_EXLLAMA:
-                        log_once(
-                            logger.warning,
-                            "Exllama GPTQ cuda kernels (which are faster) could have been used, but are not currently installed, try using BUILD_EXTENSIONS=True",
+                        logger.warning(
+                            "Exllama GPTQ cuda kernels (which are faster) could have been used, but are not currently installed, try using BUILD_EXTENSIONS=True"
                         )
                     use_exllama = False
                 else:
-                    log_once(logger.info, f"Using exllama kernels v{HAS_EXLLAMA}")
-
-            g_idx = self.get_sharded(f"{prefix}.g_idx", dim=0)
-
-            if use_exllama and groupsize != -1:
-                qzeros = self.get_sharded(f"{prefix}.qzeros", dim=0)
-                scales = self.get_sharded(f"{prefix}.scales", dim=0)
-            else:
-                qzeros = self.get_tensor(f"{prefix}.qzeros")
-                scales = self.get_tensor(f"{prefix}.scales")
+                    logger.info("Using exllama kernels")
 
             if use_exllama:
-                g_idx = g_idx - g_idx[0]
+                if groupsize >= 0:
+                    # Exllama reorders the weights in advance and the activations on the fly, thus
+                    # the scales and zero-points do not need to be reordered.
+                    qzeros = self.get_sharded(f"{prefix}.qzeros", dim=0)
+                    scales = self.get_sharded(f"{prefix}.scales", dim=0)
+                else:
+                    qzeros = self.get_tensor(f"{prefix}.qzeros")
+                    scales = self.get_tensor(f"{prefix}.scales")
+
+                # For tp > 1, at this point we know we do not use act-order
+                if self.process_group.size() == 1:
+                    g_idx = self.get_tensor(f"{prefix}.g_idx")
+                else:
+                    g_idx = None
+            else:
+                # The triton kernel reorders the scales/zero points instead of the weight/activation.
+                # Thus, each rank needs the full qzeros/scales.
+                qzeros = self.get_tensor(f"{prefix}.qzeros")
+                scales = self.get_tensor(f"{prefix}.scales")
+                g_idx = self.get_sharded(f"{prefix}.g_idx", dim=0)
 
             weight = (qweight, qzeros, scales, g_idx, bits, groupsize, use_exllama)
         elif quantize == "awq":
-            bits, groupsize, _ = self._get_gptq_params()
+            bits, groupsize = self._get_awq_params()
 
             try:
                 qweight = self.get_sharded(f"{prefix}.qweight", dim=0)
@@ -314,70 +336,73 @@ class Weights:
 
             qzeros = self.get_sharded(f"{prefix}.qzeros", dim=0)
             scales = self.get_sharded(f"{prefix}.scales", dim=0)
-            g_idx = None
-            use_exllama = False
-
-            weight = (qweight, qzeros, scales, g_idx, bits, groupsize, use_exllama)
+            
+            weight = (qweight, qzeros, scales, bits, groupsize)
         else:
             weight = self.get_sharded(f"{prefix}.weight", dim=1)
         return weight
 
-    def _get_gptq_params(self) -> Tuple[int, int, int]:
+    def _get_gptq_params(self) -> Tuple[int, int]:
         try:
             bits = self.get_tensor("gptq_bits").item()
             groupsize = self.get_tensor("gptq_groupsize").item()
-            desc_act = False
         except (SafetensorError, RuntimeError) as e:
             try:
                 bits = self.gptq_bits
                 groupsize = self.gptq_groupsize
-                desc_act = getattr(self, "gptq_desc_act", False)
             except Exception:
                 raise e
 
-        return bits, groupsize, desc_act
+        return bits, groupsize
 
-    def _set_gptq_params(self, model_id, revision):
+    def _set_gptq_params(self, model_id):
         filename = "config.json"
         try:
             if os.path.exists(os.path.join(model_id, filename)):
                 filename = os.path.join(model_id, filename)
             else:
-                filename = hf_hub_download(
-                    model_id, filename=filename, revision=revision
-                )
+                filename = hf_hub_download(model_id, filename=filename)
             with open(filename, "r") as f:
                 data = json.load(f)
             self.gptq_bits = data["quantization_config"]["bits"]
             self.gptq_groupsize = data["quantization_config"]["group_size"]
-            self.gptq_desc_act = data["quantization_config"]["desc_act"]
         except Exception:
             filename = "quantize_config.json"
             try:
                 if os.path.exists(os.path.join(model_id, filename)):
                     filename = os.path.join(model_id, filename)
                 else:
-                    filename = hf_hub_download(
-                        model_id, filename=filename, revision=revision
-                    )
+                    filename = hf_hub_download(model_id, filename=filename)
                 with open(filename, "r") as f:
                     data = json.load(f)
                 self.gptq_bits = data["bits"]
                 self.gptq_groupsize = data["group_size"]
-                self.gptq_desc_act = data["desc_act"]
             except Exception:
-                filename = "quant_config.json"
-                try:
-                    if os.path.exists(os.path.join(model_id, filename)):
-                        filename = os.path.join(model_id, filename)
-                    else:
-                        filename = hf_hub_download(
-                            model_id, filename=filename, revision=revision
-                        )
-                    with open(filename, "r") as f:
-                        data = json.load(f)
-                    self.gptq_bits = data["w_bit"]
-                    self.gptq_groupsize = data["q_group_size"]
-                    self.gptq_desc_act = data["desc_act"]
-                except Exception:
-                    pass
+                pass
+
+    def _get_awq_params(self) -> Tuple[int, int]:
+        # TODO(ningpeiyang): support load awq_params from weights
+        try:
+            bits = self.awq_bits
+            groupsize = self.awq_groupsize
+        except Exception:
+            raise RuntimeError("awq_bits or awq_groupsize not set")
+        return bits, groupsize
+
+    def _set_awq_params(self, model_id):
+        # NOTE(ningpeiyang): quant_config.json was generated by AutoAWQ, its format like this:
+        # {
+        #     "zero_point": true,
+        #     "q_group_size": 128,
+        #     "w_bit": 4
+        # }
+
+        # TODO(ningpeiyang): support read config from config.json
+        filename = "quant_config.json"
+        filename = os.path.join(model_id, filename)
+        with open(filename, "r") as f:
+            data = json.load(f)
+            self.awq_bits = data["w_bit"]
+            self.awq_groupsize = data["q_group_size"]
+            self.awq_zero_point = data["zero_point"]
+

@@ -24,6 +24,8 @@ class Model(ABC):
         world_size: int = 1,
         sliding_window: Optional[int] = None,
         speculate: Optional[int] = None,
+        tp_world_size: int = None,
+        pp_world_size: int = None,
     ):
         self.model = model.eval()
         self.tokenizer = tokenizer
@@ -34,6 +36,9 @@ class Model(ABC):
         self.rank = rank
         self.world_size = world_size
         self.sliding_window = sliding_window if sliding_window != -1 else None
+
+        self.tp_world_size = tp_world_size if tp_world_size is not None else world_size
+        self.pp_world_size = pp_world_size if pp_world_size is not None else 1
 
         if speculate is None:
             speculate = get_speculate()

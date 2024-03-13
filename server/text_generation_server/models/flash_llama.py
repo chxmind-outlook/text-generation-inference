@@ -9,6 +9,7 @@ from typing import Optional
 from text_generation_server.models import FlashCausalLM
 from text_generation_server.models.custom_modeling.flash_llama_modeling import (
     FlashLlamaForCausalLM,
+    FlashLlamaForCausalLM_PP2,
     LlamaConfig,
 )
 from text_generation_server.utils import (
@@ -28,9 +29,18 @@ class FlashLlama(FlashCausalLM):
         quantize: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
         trust_remote_code: bool = False,
-        use_medusa: Optional[str] = None,
+        use_medusa= None,
     ):
-        self.process_group, rank, world_size = initialize_torch_distributed()
+        (
+            self.process_group,
+            self.tp_group,
+            self.pp_group_0_1,
+            self.pp_group_1_0,
+            rank,
+            world_size,
+            tp_world_size,
+            pp_world_size,
+        ) = initialize_torch_distributed()
         if torch.cuda.is_available():
             device = torch.device(f"cuda:{rank}")
             dtype = torch.float16 if dtype is None else dtype
@@ -62,30 +72,19 @@ class FlashLlama(FlashCausalLM):
         torch.distributed.barrier(group=self.process_group)
 
         filenames = weight_files(model_id, revision=revision, extension=".safetensors")
-        weights = Weights(filenames, device, dtype, process_group=self.process_group)
-        if config.quantize in ["gptq", "awq"]:
-            weights._set_gptq_params(model_id, revision)
+        weights = Weights(filenames, device, dtype, process_group=self.process_group, tp_group=self.tp_group)
+        if config.quantize == "gptq":
+            weights._set_gptq_params(model_id)
+        elif config.quantize == "awq":
+            weights._set_awq_params(model_id)
 
-        model = FlashLlamaForCausalLM(config, weights)
-        if use_medusa:
-            from text_generation_server.utils.medusa import MedusaModel
-            from huggingface_hub import hf_hub_download
-            import json
-
-            medusa_config = hf_hub_download(
-                use_medusa, revision=revision, filename="config.json"
-            )
-            with open(medusa_config, "r") as f:
-                config = json.load(f)
-            medusa_head = hf_hub_download(
-                use_medusa, revision=revision, filename="medusa_lm_head.pt"
-            )
-            medusa_sf = medusa_head[: -len(".pt")] + ".safetensors"
-            weights = Weights(
-                [medusa_sf], device, dtype, process_group=self.process_group
-            )
-            lm_head = model.lm_head
-            model.lm_head = MedusaModel(config, weights, lm_head)
+        if pp_world_size == 1:
+            model = FlashLlamaForCausalLM(config, weights)
+        elif pp_world_size == 2:
+            stage = 0 if rank < tp_world_size else 1
+            model = FlashLlamaForCausalLM_PP2(config, weights, stage, self.tp_group, self.pp_group_0_1, self.pp_group_1_0,)
+        else:
+            raise NotImplementedError("Support No PP or PP=2 only")
 
         torch.distributed.barrier(group=self.process_group)
         super(FlashLlama, self).__init__(
@@ -98,4 +97,6 @@ class FlashLlama(FlashCausalLM):
             device=device,
             rank=rank,
             world_size=world_size,
+            tp_world_size=tp_world_size,
+            pp_world_size=pp_world_size,
         )

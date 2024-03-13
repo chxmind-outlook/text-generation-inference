@@ -658,6 +658,8 @@ class FlashCausalLM(Model):
         rank: int = 0,
         world_size: int = 1,
         sliding_window: Optional[int] = None,
+        tp_world_size: int = None,
+        pp_world_size: int = None,
     ):
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -672,6 +674,8 @@ class FlashCausalLM(Model):
             rank=rank,
             world_size=world_size,
             sliding_window=sliding_window,
+            tp_world_size=tp_world_size,
+            pp_world_size=pp_world_size,
         )
 
     @property
@@ -715,7 +719,7 @@ class FlashCausalLM(Model):
         num_blocks = (
             int(free_memory // total_cache_size)
             # Add batch.blocks as we allocated it above, so it is included in the peak memory.
-            + cache_manager.num_blocks
+            # + cache_manager.num_blocks
         )
 
         del batch
@@ -823,6 +827,12 @@ class FlashCausalLM(Model):
         except Exception as e:
             del batch
             raise e
+        
+         # Results
+        generations: List[Generation] = []        
+        if self.pp_world_size > 1 and out is None:
+            # "out" is None means it's not final output, return empty respone
+            return generations, None
 
         if isinstance(out, tuple):
             out, speculative_logits = out

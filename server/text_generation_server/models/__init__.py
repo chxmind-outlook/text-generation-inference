@@ -55,10 +55,9 @@ try:
         FlashSantacoderSharded,
     )
     from text_generation_server.models.idefics import IDEFICSSharded
-    from text_generation_server.models.flash_mistral import FlashMistral
-    from text_generation_server.models.flash_mixtral import FlashMixtral
-    from text_generation_server.utils.flash_attn import HAS_FLASH_ATTN_V2_CUDA
-
+    # from text_generation_server.models.flash_mistral import FlashMistral
+    # from text_generation_server.models.flash_mixtral import FlashMixtral
+    # from text_generation_server.utils.flash_attn import HAS_FLASH_ATTN_V2_CUDA
 except ImportError as e:
     logger.warning(f"Could not import Flash Attention enabled models: {e}")
     FLASH_ATTENTION = False
@@ -70,8 +69,8 @@ if FLASH_ATTENTION:
     __all__.append(FlashSantacoderSharded)
     __all__.append(FlashLlama)
     __all__.append(IDEFICSSharded)
-    __all__.append(FlashMistral)
-    __all__.append(FlashMixtral)
+    # __all__.append(FlashMistral)
+    # __all__.append(FlashMixtral)
 
 
 def get_model(
@@ -280,31 +279,31 @@ def get_model(
                     trust_remote_code=trust_remote_code,
                 )
 
-    if model_type == "mistral":
-        sliding_window = config_dict.get("sliding_window", -1)
-        if (
-            (sliding_window is None or sliding_window == -1) and FLASH_ATTENTION
-        ) or HAS_FLASH_ATTN_V2_CUDA:
-            return FlashMistral(
-                model_id,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
+    # if model_type == "mistral":
+    #     sliding_window = config_dict.get("sliding_window", -1)
+    #     if (
+    #         (sliding_window is None or sliding_window == -1) and FLASH_ATTENTION
+    #     ) or HAS_FLASH_ATTN_V2_CUDA:
+    #         return FlashMistral(
+    #             model_id,
+    #             revision,
+    #             quantize=quantize,
+    #             dtype=dtype,
+    #             trust_remote_code=trust_remote_code,
+    #         )
 
-    if model_type == "mixtral":
-        sliding_window = config_dict.get("sliding_window", -1)
-        if (
-            (sliding_window is None or sliding_window == -1) and FLASH_ATTENTION
-        ) or HAS_FLASH_ATTN_V2_CUDA:
-            return FlashMixtral(
-                model_id,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
+    # if model_type == "mixtral":
+    #     sliding_window = config_dict.get("sliding_window", -1)
+    #     if (
+    #         (sliding_window is None or sliding_window == -1) and FLASH_ATTENTION
+    #     ) or HAS_FLASH_ATTN_V2_CUDA:
+    #         return FlashMixtral(
+    #             model_id,
+    #             revision,
+    #             quantize=quantize,
+    #             dtype=dtype,
+    #             trust_remote_code=trust_remote_code,
+    #         )
 
     if model_type == "opt":
         return OPTSharded(
